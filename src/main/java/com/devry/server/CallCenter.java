@@ -18,17 +18,20 @@ import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.DefaultSSLWebSocketServerFactory;
 import org.java_websocket.server.WebSocketServer;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-public class SignalingServer extends WebSocketServer {
+public class CallCenter extends WebSocketServer {
 
-	static final Logger LOGGER = Logger.getLogger(SignalingServer.class);
+	static final Logger LOGGER = Logger.getLogger(CallCenter.class);
 
-	private static Map<String, Room> rooms = new HashMap<String, Room>();
+	private static Map<String, Call> calls = new HashMap<String, Call>();
+	
+	// SocketMap is used to find call entry from calls based on callerId.
 	private static Map<Integer, String> socketMap = new HashMap<Integer, String>();
 
-	public SignalingServer(InetSocketAddress address) {
+	public CallCenter(InetSocketAddress address) {
 		super(address);
 	}
 
@@ -39,16 +42,18 @@ public class SignalingServer extends WebSocketServer {
 		if (data == null) {
 			return;
 		}
+		socketMap.remove(socket.hashCode());
+
 		String[] userInfo = data.split(":");
 		String username = userInfo[0];
-		String roomname = userInfo[1];
+		String callerId = userInfo[1];
 		
-		Room room = rooms.get(roomname);
-		room.removeUser(username);
+		Call call = calls.get(callerId);
+		call.removeUser(username);
 
-		if (username.equalsIgnoreCase(room.getHostName())) {
-			rooms.remove(roomname);
-			room.close();
+		if (username.equalsIgnoreCase(call.getHostName())) {
+			calls.remove(callerId);
+			call.close();
 		}			
 	}
 
@@ -65,81 +70,83 @@ public class SignalingServer extends WebSocketServer {
 	}
 
 	private void processMessage(WebSocket socket, final String message) {
-		Room room;
+		Call call;
 		
 		try {
 			JSONObject jsonObj = new JSONObject(message);
 			String type = jsonObj.has("type") ? jsonObj.getString("type") : "";
 			String username = jsonObj.has("username") ? jsonObj.getString("username") : "";
-			String roomname = jsonObj.has("roomname") ? jsonObj.getString("roomname") : System.currentTimeMillis() + "-" + username;
+			String callerId = jsonObj.has("callerId") ? jsonObj.getString("callerId") : System.currentTimeMillis() + "-" + username;
 
 			
 			switch (type) {
 
 			case "login":
-				// Create a room
-//				if (roomname.length() < 1) {
-//					jsonObj.put("success", "false").put("value", "Room name is empty");
-//					socket.send(jsonObj.toString());
-//					return;
-//				}
-//
-//				if (rooms.get(roomname) != null) {
-//					jsonObj.put("success", "false").put("value", "Room already taken");
-//					socket.send(jsonObj.toString());
-//					return;					
-//				}
+			case "call":
 
-				room = new Room(roomname, 2);
-				room.setHost(username, socket);
-				rooms.put(roomname, room);
-				LOGGER.debug("Generated room for: " + username);
+				if (username.length() == 0) {
+					socket.send("{\"type\":\"error\", \"message\":\"Missing username\"}");
+					return;
+				}
+				call = new Call(callerId, 3);
+				call.setHost(username, socket);
+				calls.put(callerId, call);
+				LOGGER.debug("Generated call for: " + username);
 				jsonObj.put("success", "true");
-				jsonObj.put("roomname", roomname);
+				jsonObj.put("callerId", callerId);
 				socket.send(jsonObj.toString());
 				
-				socketMap.put(socket.hashCode(), username + ":" + roomname);
+				socketMap.put(socket.hashCode(), username + ":" + callerId);
 
 				break;
 			
-			case "rooms":
-				// Return room list
-				LOGGER.debug("Rooms requested by: " + username);				
-				Set<String> roomnames = getRooms();
-				jsonObj.put("value", roomnames);
+			case "calls":
+				// Return call list
+				LOGGER.debug("Calls requested by: " + username);				
+				Set<String> callerIds = getCalls();
+				jsonObj.put("value", callerIds);
 				socket.send(jsonObj.toString());
 				break;
 
+			case "callList":
+				// Return call list
+				LOGGER.debug("Calls requested by: " + username);
+				jsonObj.put("value", getCallList());
+				socket.send(jsonObj.toString());
+				break;
+				
 			case "join":
-				// Join a room
-				room = rooms.get(roomname);
+				// Join a call
+				call = calls.get(callerId);
 
-				if (room == null) {
-					jsonObj.put("success", "false").put("value", "Room not exist");
+				if (call == null) {
+					jsonObj.put("success", "false").put("value", "Call does not exist");
 					socket.send(jsonObj.toString());
 					return;
 				}
 				
-				room.addUser(username, socket);
+				call.addUser(username, socket);
 				jsonObj.put("success", "true");
 				socket.send(jsonObj.toString());
 				
-				socketMap.put(socket.hashCode(), username + ":" + roomname);
+				socketMap.put(socket.hashCode(), username + ":" + callerId);
 
 				break;
 
 			case "leave":
-				leaveRoom(socket, jsonObj);
+				leaveCall(socket, jsonObj);
 
 				break;
 				
 			case "offer":
-			case "answer":
 			case "candidate":
+				processMessage(socket, callerId, jsonObj);
+				break;
+			case "answer":
 				LOGGER.debug("TYPE: " + type);				
 				LOGGER.debug("USERNAME: " + username);				
-				LOGGER.debug("ROOMNAME: " + roomname);				
-				processMessage(socket, roomname, jsonObj);
+				LOGGER.debug("ROOMNAME: " + callerId);				
+				processMessage(socket, callerId, jsonObj);
 				break;
 				
 			default:
@@ -152,28 +159,32 @@ public class SignalingServer extends WebSocketServer {
 
 	}
 
-	private void leaveRoom(WebSocket currentSocket, JSONObject jsonObj) {
+	private void leaveCall(WebSocket currentSocket, JSONObject jsonObj) {
 		
 		socketMap.remove(currentSocket.hashCode());
 
 		String username = jsonObj.getString("username");
-		String roomname = jsonObj.getString("roomname");
+		String callerId = jsonObj.getString("callerId");
 
-		Room room = rooms.get(roomname);
-		if (room != null) {
-			room.removeUser(username);
-			processMessage(currentSocket, roomname, jsonObj);
-
-			if (username.equalsIgnoreCase(room.getHostName())) {
-				rooms.remove(roomname);
-				room.close();
-			}				
+		Call call = calls.get(callerId);
+		if (call != null) {
+			call.removeUser(username);
+			processMessage(currentSocket, callerId, jsonObj);
+			WebSocket savedSocket = call.getSavedSocket();
+			if (savedSocket != null) {
+				savedSocket.send(jsonObj.toString());				
+			}
+			
+			//if (username.equalsIgnoreCase(call.getHostName())) {
+				calls.remove(callerId);
+				call.close();
+			//}				
 		}
 	}
 	
-	private void processMessage(WebSocket currentSocket, String roomname, JSONObject jsonObj) {
-		Room room = rooms.get(roomname);
-		Map<String, WebSocket> users = room.getUsers();
+	private void processMessage(WebSocket currentSocket, String callerId, JSONObject jsonObj) {
+		Call call = calls.get(callerId);
+		Map<String, WebSocket> users = call.getUsers();
 		for(Map.Entry<String, WebSocket> user : users.entrySet()) {
 			WebSocket socket = user.getValue();
 			if (socket != currentSocket) {
@@ -182,8 +193,22 @@ public class SignalingServer extends WebSocketServer {
 		};
 	}
 
-	private Set<String> getRooms() {
-		return rooms.keySet();	
+	private Set<String> getCalls() {
+		return calls.keySet();	
+	}
+
+	private JSONObject getCallList() {
+
+		JSONObject jsonObj = new JSONObject();
+
+		for (Map.Entry<String, Call> entry : calls.entrySet()) {
+			Call call = (Call)entry.getValue();
+			Set<String> users = call.getUsers().keySet();
+			
+			jsonObj.put(entry.getKey(), new JSONArray( users.toArray() ));			
+		}
+		
+		return jsonObj;
 	}
 
 	@Override
@@ -198,7 +223,7 @@ public class SignalingServer extends WebSocketServer {
 		
 		InetSocketAddress socketAddress = new InetSocketAddress(8443);
 		
-		SignalingServer main = new SignalingServer(socketAddress);
+		CallCenter main = new CallCenter(socketAddress);
 		
 		// load up the key store
 		String STORETYPE = "JKS";
